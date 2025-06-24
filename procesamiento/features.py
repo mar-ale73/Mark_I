@@ -65,7 +65,7 @@ def calcular_ema(df, periodo=20):
 
 
 def agregar_volumen(df):
-    df['Volumen_normalizado'] = df['tick_volume'] / df['tick_volume'].rolling(window=20).mean()
+    df['Volumen_normalizado'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
     return df
 
 

@@ -1,6 +1,6 @@
 MetaTrader5==5.0.44
 pandas>=1.5
-numpy>=1.21
+numpy<2.0
 matplotlib>=3.5
 scikit-learn>=1.0
 ta==0.10.2
@@ -8,3 +8,4 @@ beautifulsoup4>=4.9
 requests>=2.28
 prophet==1.1.5
 openpyxl>=3.0
+PyYAML>=6.0

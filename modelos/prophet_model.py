@@ -25,4 +25,12 @@ def predecir_precio(modelo: Prophet, pasos: int = 3, frecuencia: str = '15min') 
     """
     futuro = modelo.make_future_dataframe(periods=pasos, freq=frecuencia)
     forecast = modelo.predict(futuro)
-    return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(pasos)
+
+    resultado = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(pasos)
+    resultado = resultado.rename(columns={
+        'ds': 'timestamp_prediccion',
+        'yhat': 'precio_estimado',
+        'yhat_lower': 'min_esperado',
+        'yhat_upper': 'max_esperado'
+    })
+    return resultado

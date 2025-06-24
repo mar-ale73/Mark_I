@@ -1,0 +1,14 @@
+# Configuración del sistema de inversión
+
+# === Parámetros del mercado ===
+simbolo: EURUSD
+timeframe: M5
+cantidad_datos: 2000
+
+# === Parámetros del modelo ===
+modelo: prophet
+pasos_prediccion: 3
+frecuencia_prediccion: '5min'
+
+# === Parámetros del agente de análisis ===
+umbral_senal: 0.0002
