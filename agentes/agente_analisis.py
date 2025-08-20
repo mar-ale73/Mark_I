@@ -2,21 +2,17 @@ import pandas as pd
 
 def generar_senal_operativa(predicciones: pd.DataFrame, umbral: float = 0.0003) -> str:
     """
-    Genera una señal operativa a partir de las predicciones de un modelo.
-
-    Parámetros:
-    - predicciones: DataFrame con columnas ['ds', 'yhat'].
-    - umbral: variación mínima esperada para considerar una señal de compra o venta.
-
-    Retorna:
-    - 'comprar', 'vender' o 'mantener'
+    Genera una señal operativa a partir de la primera y última predicción del modelo.
     """
     if len(predicciones) < 2:
         return 'mantener'
 
-    precio_actual = predicciones.iloc[-2]['precio_estimado']
-    precio_futuro = predicciones.iloc[-1]['precio_estimado']
-    variacion = precio_futuro - precio_actual
+    precio_inicial = predicciones.iloc[0]['precio_estimado']
+    precio_final = predicciones.iloc[-1]['precio_estimado']
+    variacion = precio_final - precio_inicial
+
+    print(f"📊 Comparando precio inicial {precio_inicial:.5f} y final {precio_final:.5f}")
+    print(f"📈 Variación estimada: {variacion:.5f} ({variacion * 10000:.2f} pips)")
 
     if variacion > umbral:
         return 'comprar'

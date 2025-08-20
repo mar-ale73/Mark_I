@@ -73,7 +73,6 @@ class Basic_funcs():
         rates = mt5.copy_rates_from_pos(par, periodo, 0, cantidad)  
         tabla = pd.DataFrame(rates)
         tabla['time']=pd.to_datetime(tabla['time'], unit='s')
-
         return tabla
     
     def obtener_ordenes_pendientes(self) -> pd.DataFrame:
@@ -132,7 +131,11 @@ class Basic_funcs():
 
             }
 
-            mt5.order_send(orden)
+            resultado = mt5.order_send(orden)
+            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
+            else:
+                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
 
             print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
         
@@ -150,7 +153,11 @@ class Basic_funcs():
 
             }
 
-            mt5.order_send(orden)
+            resultado = mt5.order_send(orden)
+            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
+            else:
+                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
             print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
 
         elif (sl != None) and (tp == None):
@@ -167,7 +174,11 @@ class Basic_funcs():
 
             }
 
-            mt5.order_send(orden)
+            resultado = mt5.order_send(orden)
+            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
+            else:
+                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
         
         elif (sl != None) and (tp != None):
             orden = {
@@ -184,7 +195,11 @@ class Basic_funcs():
 
             }
 
-            mt5.order_send(orden)
+            resultado = mt5.order_send(orden)
+            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
+            else:
+                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
             print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
    
     def close_all_open_operations(self,data:pd.DataFrame) -> None:
@@ -335,7 +350,10 @@ class Basic_funcs():
         ticks_at_risk = abs(current_price - sl) / tick_size
         tick_value = symbol_info.trade_tick_value
 
-        position_size = round((balance * risk_per_trade) / (ticks_at_risk * tick_value),2)
+        position_size = (balance * risk_per_trade) / (ticks_at_risk * tick_value)
+        position_size = round(max(position_size, 0.01), 2)
+        return position_size
+
 
         return position_size
     

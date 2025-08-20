@@ -7,7 +7,7 @@ from datetime import datetime
 def ejecutar_operacion(simbolo: str, senal: str, capital: float, precio_actual: float) -> dict:
     if senal == 'mantener' or capital <= 0:
         return {
-            'operacion': 'ninguna',
+            'operacion': 'ninguna',     
             'capital_usado': 0,
             'precio': precio_actual,
             'resultado': 'sin acción'

@@ -1,14 +1,40 @@
-# Configuración del sistema de inversión
-
-# === Parámetros del mercado ===
-simbolo: EURUSD
-timeframe: M5
+# === Configuración General ===
+simbolo: "EURUSD"
+timeframe: "M5"
 cantidad_datos: 2000
 
-# === Parámetros del modelo ===
-modelo: prophet
-pasos_prediccion: 3
-frecuencia_prediccion: '5min'
+# Modelo activo
+modelo: "prophet"
+pasos_prediccion: 100           # pasos a predecir (p. ej., 12 para ~1h en M5)
+frecuencia_prediccion: "5min"
+umbral_senal: 0.0005            # ~5 pips en EURUSD
 
-# === Parámetros del agente de análisis ===
-umbral_senal: 0.0002
+# === Parámetros de Trading ===
+riesgo_por_trade: 0.02          # 2% del balance
+volumen_minimo: 0.01            # lotaje mínimo
+stop_loss_pips: 10
+take_profit_pips: 20
+pip_size: 0.0001                # si lo omites, se infiere con mt5.symbol_info
+
+# === Reportes ===
+ruta_reporte: "outputs/reporte_inversion.xlsx"
+
+# === EDA (CRISP-DM) ===
+eda:
+  habilitar: true
+  frecuencia_resampleo: "D"     # "D", "H", "15T", etc.
+  stl_periodo: 7                # 7 para diario, 24 para horario, etc.
+  outdir: "outputs/eda"
+
+# === SPY para EDA (elige UNA opción) ===
+# Opción A (si tu broker lo ofrece):
+simbolo_spy: ".US500Cash"  # o el símbolo que uses para SPY en tu broker
+# Opción B (si no existe en tu broker, usar CSV):
+# spy_csv: "data/spy.csv"       # columnas mínimas: timestamp, Close
+
+# === Credenciales / terminal MT5 ===
+mt5:
+  login: 68238343
+  password: "Colombia123*"
+  server: "RoboForex-Pro"
+  path: "C:\\Program Files\\RoboForex - MetaTrader 5\\terminal64.exe"
