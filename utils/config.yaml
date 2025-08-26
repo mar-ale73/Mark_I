@@ -22,9 +22,16 @@ ruta_reporte: "outputs/reporte_inversion.xlsx"
 # === EDA (CRISP-DM) ===
 eda:
   habilitar: true
-  frecuencia_resampleo: "D"     # "D", "H", "15T", etc.
-  stl_periodo: 7                # 7 para diario, 24 para horario, etc.
+  frecuencia_resampleo: "H"         # o "D", "15T", etc.
   outdir: "outputs/eda"
+  ventana_media_movil: 30
+  acf_lags: 40
+  rolling_vol_windows: [20,60,120]
+  rolling_corr_window: 60
+  export_pdf: true
+  pdf_filename: "EDA_informe.pdf"
+  alias_eur: "EURUSD"
+  alias_spy: "US500"                 # si usas .US500Cash en MT5
 
 # === SPY para EDA (elige UNA opción) ===
 # Opción A (si tu broker lo ofrece):
