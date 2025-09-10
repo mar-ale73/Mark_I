@@ -1,45 +1,56 @@
-# procesamiento/eda_crispdm.py  (versión extendida con PDF + Excel + insights)
-import os
-import warnings
+# procesamiento/eda_pipeline.py
+# Ejecuta el EDA (PDF + Excel) y deriva recomendaciones de modelado/operación
+# a partir de la evidencia (STL, volatilidad, ATR, correlación).
+#
+# Requisitos: pandas, numpy, matplotlib, statsmodels, scipy, xlsxwriter/openpyxl
+# Usa: from procesamiento.eda_crispdm import ejecutar_eda
+
+from __future__ import annotations
+import os, json
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from typing import Optional, Dict, Any, Tuple
 from statsmodels.tsa.seasonal import STL
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from matplotlib.backends.backend_pdf import PdfPages
-from scipy import stats as sstats  # Jarque–Bera, etc.
 
-warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+try:
+    from procesamiento.eda_crispdm import ejecutar_eda
+except Exception:
+    # fallback si el import relativo no aplica en tu estructura
+    from eda_crispdm import ejecutar_eda
+
 
 # =======================
-# Utilidades
+# Helpers mínimos (independientes del EDA)
 # =======================
 def _safe_mkdir(p: str):
     if not os.path.exists(p):
         os.makedirs(p)
 
-def _ensure_dt_index(df: pd.DataFrame, col_candidates=("timestamp","date","datetime","Date","Datetime")) -> pd.DataFrame:
-    """Asegura índice datetime (UTC) a partir de una columna de tiempo conocida."""
+def _ensure_dt_index(df: pd.DataFrame, col_candidates=("time","timestamp","date","datetime","Date","Datetime")) -> pd.DataFrame:
+    """Asegura índice datetime (sin tz) desde columna o índice existente."""
     d = df.copy()
     dtcol = next((c for c in col_candidates if c in d.columns), None)
     if dtcol is None:
         if isinstance(d.index, pd.DatetimeIndex):
-            return d.sort_index()
-        raise ValueError(f"No se encontró columna de tiempo en {list(d.columns)}")
-    d[dtcol] = pd.to_datetime(d[dtcol], errors="coerce", utc=True)
-    d = d.dropna(subset=[dtcol]).sort_values(dtcol).set_index(dtcol)
+            idx = d.index
+        else:
+            raise ValueError(f"No se encontró columna de tiempo en {list(d.columns)}")
+    else:
+        idx = pd.to_datetime(d[dtcol], errors="coerce", utc=True)
+    d = d.copy()
+    d.index = pd.to_datetime(idx).tz_localize(None)
+    d = d.sort_index()
     return d
 
 def _find_close(df: pd.DataFrame) -> str:
-    """Encuentra la columna de precio de cierre."""
     for c in ["Close", "close", "Adj Close", "price", "Price"]:
         if c in df.columns:
             return c
     raise ValueError("No se encontró columna de precio/cierre.")
 
 def _resample_ohlc(df: pd.DataFrame, freq: str, price_col: str) -> pd.DataFrame:
-    """Resamplea a la frecuencia deseada, preservando OHLC si existen; de lo contrario, último cierre."""
-    freq = str(freq).lower()
+    """Resamplea a frecuencia deseada; preserva OHLC si existen, si no usa último cierre."""
+    freq = str(freq)
     cols_lower = [c.lower() for c in df.columns]
     has_ohlc = all(x in cols_lower for x in ["open","high","low",price_col.lower()])
 
@@ -65,60 +76,12 @@ def _resample_ohlc(df: pd.DataFrame, freq: str, price_col: str) -> pd.DataFrame:
 
     return out.dropna(how="any")
 
-def _stl_period_by_freq(freq: str) -> int:
-    """Elige un período STL razonable según la frecuencia."""
-    f = str(freq).upper()
-    if f in ("D","1D"):      # diario: semana
-        return 7
-    if f in ("H","1H"):      # horario: 24 horas
-        return 24
-    if f.endswith("T"):      # minutos: 1 día / intervalo
-        try:
-            minutes = int(f[:-1])
-            return max(7, int((24*60)/minutes))
-        except:
-            return 7
-    return 7
-
-def _to_naive_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Quita tz del índice para Excel/PDF."""
-    d = df.copy()
-    if isinstance(d.index, pd.DatetimeIndex) and getattr(d.index, "tz", None) is not None:
-        d.index = d.index.tz_localize(None)
-    return d
-
-# =======================
-# Cálculos adicionales
-# =======================
-def _compute_returns_blocks(df: pd.DataFrame, price_col: str):
+def _compute_returns_blocks(df: pd.DataFrame, price_col: str) -> Tuple[pd.Series, pd.Series]:
     r = df[price_col].pct_change()
     lr = np.log(df[price_col]).diff()
     return r, lr
 
-def _compute_drawdown(price: pd.Series) -> pd.Series:
-    cummax = price.cummax()
-    dd = price / cummax - 1.0
-    return dd
-
-def _compute_stats(logret: pd.Series) -> pd.DataFrame:
-    s = logret.dropna()
-    if s.empty:
-        return pd.DataFrame([{}])
-    jb_stat, jb_p = sstats.jarque_bera(s)
-    out = {
-        "count": int(s.count()),
-        "mean": float(s.mean()),
-        "std": float(s.std()),
-        "skew": float(s.skew()),
-        "kurtosis": float(s.kurtosis()),
-        "JB_stat": float(jb_stat),
-        "JB_pvalue": float(jb_p),
-        "VaR_95": float(np.percentile(s, 5)),
-        "ES_95": float(s[s <= np.percentile(s, 5)].mean()) if (s <= np.percentile(s, 5)).any() else np.nan,
-    }
-    return pd.DataFrame([out])
-
-def _atr_if_available(df: pd.DataFrame) -> pd.Series | None:
+def _atr_if_available(df: pd.DataFrame) -> Optional[pd.Series]:
     cols = [c.lower() for c in df.columns]
     has = all(x in cols for x in ["high","low"])
     close_name = next((c for c in df.columns if c.lower() in ("close","price","adj close")), None)
@@ -127,376 +90,321 @@ def _atr_if_available(df: pd.DataFrame) -> pd.Series | None:
         low = df[[c for c in df.columns if c.lower()=="low"][0]].astype(float)
         close = df[close_name].astype(float)
         prev_close = close.shift(1)
-        tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-        atr = tr.rolling(14).mean()
+        tr = np.maximum((high - low).to_numpy(),
+                        np.maximum((high - prev_close).abs().to_numpy(),
+                                   (low - prev_close).abs().to_numpy()))
+        atr = pd.Series(tr, index=df.index).rolling(14).mean()
         return atr
     return None
 
-# =======================
-# Gráficos (nombres claros)
-# =======================
-def _plot_precio_tendencia(df, price_col, symbol, outdir, win_ma):
-    plt.figure(figsize=(11,5))
-    plt.plot(df.index, df[price_col], label="Precio")
-    if win_ma and win_ma > 1 and win_ma < len(df):
-        ma = df[price_col].rolling(win_ma, min_periods=max(2, win_ma//3)).mean()
-        plt.plot(df.index, ma, label=f"Media móvil ({win_ma})")
-    plt.title(f"{symbol} · 01 Precio y Tendencia (MA)")
-    plt.xlabel("Tiempo"); plt.ylabel("Precio")
-    plt.legend(); plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_01_precio_tendencia.png")
-    plt.savefig(path); plt.close()
-    return path
+def _seasonal_period_by_freq(freq: str) -> int:
+    f = str(freq).upper()
+    if f in ("D","1D"): return 7        # semana
+    if f in ("H","1H"): return 24       # 24 horas
+    if f.endswith("T"):                 # minutos → ciclo diario aprox
+        try:
+            minutes = int(f[:-1])
+            return max(7, int((24*60)/minutes))
+        except:
+            return 7
+    return 7
 
-def _plot_serie_precio(df, price_col, symbol, outdir):
-    plt.figure(figsize=(11,4))
-    plt.plot(df.index, df[price_col])
-    plt.title(f"{symbol} · 02 Serie de tiempo (Precio)")
-    plt.xlabel("Tiempo"); plt.ylabel("Precio")
-    plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_02_serie_precio.png")
-    plt.savefig(path); plt.close()
-    return path
+def _stl_strength(y: pd.Series, period: int) -> Dict[str, float]:
+    """Mide 'fuerza' estacional y de tendencia (Wang et al., 2006): 1 - Var(resid)/Var(resid+component)."""
+    y = np.log(y.dropna())
+    if len(y) < period*3:
+        return {"seasonal_strength": np.nan, "trend_strength": np.nan}
+    stl = STL(y, period=period, robust=True).fit()
+    resid = stl.resid
+    seasonal = stl.seasonal
+    trend = stl.trend
+    var = np.var
+    s_strength = 1.0 - var(resid) / var(resid + seasonal)
+    t_strength = 1.0 - var(resid) / var(resid + trend)
+    return {"seasonal_strength": float(s_strength), "trend_strength": float(t_strength)}
 
-def _plot_stl(df, price_col, symbol, outdir, seasonal):
-    y = np.log(df[price_col].dropna())
-    if len(y) < seasonal*3:
-        return None
-    stl = STL(y, period=seasonal, robust=True).fit()
-    fig = stl.plot()
-    fig.set_size_inches(10,7)
-    fig.suptitle(f"{symbol} · 03 Descomposición STL (log precio)")
-    fig.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_03_stl.png")
-    fig.savefig(path); plt.close(fig)
-    return path
+def _pips_from_price(delta_price: float, symbol_alias: str) -> float:
+    # Para EURUSD y pares con 4 decimales, 1 pip ≈ 0.0001
+    # Ajusta aquí si incorporas JPY u otros.
+    if symbol_alias.upper().startswith("EURUSD"):
+        return delta_price * 10_000.0
+    return delta_price * 10_000.0  # default
 
-def _plot_hist_kde(logret, symbol, outdir):
-    s = logret.dropna()
-    if s.empty: return None
-    plt.figure(figsize=(10,5))
-    plt.hist(s, bins=60, density=True, alpha=0.6)
-    s.plot(kind="kde")
-    plt.title(f"{symbol} · 04 Distribución de log-returns (Hist + KDE)")
-    plt.xlabel("log-return"); plt.ylabel("Densidad")
-    plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_04_hist_kde_logret.png")
-    plt.savefig(path); plt.close()
-    return path
-
-def _plot_qq(logret, symbol, outdir):
-    s = logret.dropna()
-    if s.empty: return None
-    plt.figure(figsize=(6,6))
-    sstats.probplot(s, dist="norm", plot=plt)
-    plt.title(f"{symbol} · 05 QQ-plot (log-returns vs Normal)")
-    plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_05_qqplot_logret.png")
-    plt.savefig(path); plt.close()
-    return path
-
-def _plot_rolling_vol(logret, symbol, outdir, windows=(20,60,120), atr=None):
-    s = logret
-    if s.dropna().empty: return None
-    plt.figure(figsize=(11,4))
-    for w in windows:
-        s.rolling(w).std().plot(label=f"σ rolling {w}")
-    if atr is not None:
-        # Escala ATR para que sea comparable (opcional). Aquí la dibujamos cruda.
-        atr.plot(label="ATR(14)", alpha=0.7)
-    plt.legend()
-    plt.title(f"{symbol} · 06 Volatilidad rolling (σ) y ATR(14)")
-    plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_06_rolling_vol.png")
-    plt.savefig(path); plt.close()
-    return path
-
-def _plot_acf_pacf(logret, symbol, outdir, lags=40):
-    s = logret.dropna()
-    if len(s) < 10: return (None, None)
-    fig = plt.figure(figsize=(12,4)); plot_acf(s, lags=lags, ax=plt.gca())
-    plt.title(f"{symbol} · 07 ACF (log-returns)"); plt.tight_layout()
-    p1 = os.path.join(outdir, f"{symbol}_07_acf_logret.png"); plt.savefig(p1); plt.close()
-    fig = plt.figure(figsize=(12,4)); plot_pacf(s, lags=lags, ax=plt.gca(), method="ywm")
-    plt.title(f"{symbol} · 08 PACF (log-returns)"); plt.tight_layout()
-    p2 = os.path.join(outdir, f"{symbol}_08_pacf_logret.png"); plt.savefig(p2); plt.close()
-    return (p1, p2)
-
-def _plot_drawdown(price, symbol, outdir):
-    dd = _compute_drawdown(price)
-    plt.figure(figsize=(11,3.8))
-    plt.fill_between(dd.index, dd.values, 0, color="tab:red", alpha=0.4)
-    plt.title(f"{symbol} · 09 Curva de drawdown")
-    plt.tight_layout()
-    path = os.path.join(outdir, f"{symbol}_09_drawdown.png")
-    plt.savefig(path); plt.close()
-    return path
-
-def _plot_rolling_corr(df_eur_lr, df_spy_lr, outdir, window=60, title_suffix="EURUSD vs SPY/US500"):
-    s = df_eur_lr.dropna().rename("lr_EURUSD").to_frame().join(
-        df_spy_lr.dropna().rename("lr_SPY").to_frame(), how="inner"
-    ).dropna()
-    if s.empty: return None, None
-    rolling_corr = s["lr_EURUSD"].rolling(window).corr(s["lr_SPY"]).dropna().to_frame("rolling_corr")
-    plt.figure(figsize=(11,4))
-    plt.plot(rolling_corr.index, rolling_corr["rolling_corr"])
-    plt.axhline(0, linestyle="--")
-    plt.title(f"10 Correlación móvil ({window}) log-returns · {title_suffix}")
-    plt.tight_layout()
-    path = os.path.join(outdir, "EURUSD_SPY_10_rolling_corr.png")
-    plt.savefig(path); plt.close()
-    return path, rolling_corr
 
 # =======================
-# Exportadores (Excel + PDF)
+# Núcleo: derivar recomendaciones
 # =======================
-def _export_excel(outpath: str, heads: dict, resumenes: dict, stats_map: dict,
-                  corr_df: pd.DataFrame|None, roll_corr: pd.DataFrame|None):
-    # elegir motor
-    try:
-        import xlsxwriter  # noqa
-        writer_kwargs = {"engine": "xlsxwriter", "datetime_format": "yyyy-mm-dd hh:mm"}
-    except ImportError:
-        writer_kwargs = {"engine": "openpyxl"}
-
-    with pd.ExcelWriter(outpath, **writer_kwargs) as w:
-        for sym, head_df in heads.items():
-            h = head_df.copy()
-            if isinstance(h.index, pd.DatetimeIndex) and getattr(h.index, "tz", None) is not None:
-                h.index = h.index.tz_localize(None)
-            h.to_excel(w, sheet_name=f"{sym}_HEAD")
-
-            r = resumenes[sym].copy()
-            for c in ("inicio","fin"):
-                if c in r.columns:
-                    r[c] = pd.to_datetime(r[c], errors="coerce", utc=True).dt.tz_localize(None)
-            r.to_excel(w, sheet_name=f"{sym}_RESUMEN", index=False)
-
-            st = stats_map.get(sym)
-            if st is not None:
-                st.to_excel(w, sheet_name=f"{sym}_STATS", index=False)
-
-        if corr_df is not None:
-            corr_df.to_excel(w, sheet_name="Correlation_matrix")
-        if roll_corr is not None:
-            rc = roll_corr.copy()
-            if isinstance(rc.index, pd.DatetimeIndex) and getattr(rc.index, "tz", None) is not None:
-                rc.index = rc.index.tz_localize(None)
-            rc.to_excel(w, sheet_name="Rolling_corr")
-
-def _add_image_page(pdf: PdfPages, img_path: str, title: str | None = None):
-    if not img_path or not os.path.exists(img_path):
-        return
-    img = plt.imread(img_path)
-    fig = plt.figure(figsize=(11, 7))
-    if title:
-        plt.suptitle(title, fontsize=16, y=0.98)
-    plt.imshow(img)
-    plt.axis("off")
-    pdf.savefig(fig)
-    plt.close(fig)
-
-def _add_table_page(pdf: PdfPages, df: pd.DataFrame, title: str, index: bool = False, max_rows: int = 30):
-    if df is None or df.empty:
-        return
-    df_show = df.copy()
-    if not index:
-        df_show = df_show.reset_index(drop=True)
-    if len(df_show) > max_rows:
-        df_show = df_show.head(max_rows)
-    df_show = df_show.applymap(lambda x: round(x, 6) if isinstance(x, (float, np.floating)) else x)
-
-    fig, ax = plt.subplots(figsize=(11, 7))
-    ax.axis("off")
-    ax.set_title(title, fontsize=16, pad=12)
-    tbl = ax.table(cellText=df_show.values, colLabels=df_show.columns, cellLoc="center", loc="center")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1.2, 1.2)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-def _export_pdf(outdir, artifacts_by_symbol: dict,
-                corr_df: pd.DataFrame|None, roll_corr: pd.DataFrame|None,
-                filename="EDA_informe.pdf"):
-    pdf_path = os.path.join(outdir, filename)
-    with PdfPages(pdf_path) as pdf:
-        # Portada
-        fig = plt.figure(figsize=(11, 7))
-        plt.axis("off")
-        plt.text(0.5, 0.72, "Informe EDA", ha="center", va="center", fontsize=28, weight="bold")
-        plt.text(0.5, 0.60, "EURUSD y segundo activo (SPY/US500)", ha="center", va="center", fontsize=14)
-        plt.text(0.5, 0.48, f"Carpeta: {outdir}", ha="center", va="center", fontsize=10)
-        pdf.savefig(fig); plt.close(fig)
-
-        # Por activo
-        for symbol, art in artifacts_by_symbol.items():
-            _add_table_page(pdf, art.get("HEAD"), f"{symbol} — HEAD (primeras filas)", index=True)
-            _add_table_page(pdf, art.get("RESUMEN"), f"{symbol} — RESUMEN", index=False)
-            _add_table_page(pdf, art.get("STATS"), f"{symbol} — STATS (log-returns)", index=False)
-
-            _add_image_page(pdf, art.get("IMG_01"), f"{symbol} — 01 Precio y Tendencia")
-            _add_image_page(pdf, art.get("IMG_02"), f"{symbol} — 02 Serie de Precio")
-            _add_image_page(pdf, art.get("IMG_03"), f"{symbol} — 03 Descomposición STL")
-            _add_image_page(pdf, art.get("IMG_04"), f"{symbol} — 04 Distribución log-returns (Hist+KDE)")
-            _add_image_page(pdf, art.get("IMG_05"), f"{symbol} — 05 QQ-plot log-returns")
-            _add_image_page(pdf, art.get("IMG_06"), f"{symbol} — 06 Volatilidad rolling y ATR")
-            _add_image_page(pdf, art.get("IMG_07"), f"{symbol} — 07 ACF log-returns")
-            _add_image_page(pdf, art.get("IMG_08"), f"{symbol} — 08 PACF log-returns")
-            _add_image_page(pdf, art.get("IMG_09"), f"{symbol} — 09 Curva de drawdown")
-
-        # Correlación entre activos
-        if corr_df is not None:
-            _add_table_page(pdf, corr_df, "Matriz de correlación (log-returns)", index=True)
-        if roll_corr is not None:
-            _add_table_page(pdf, roll_corr, "Correlación móvil (ventana)", index=True)
-            _add_image_page(pdf, os.path.join(outdir, "EURUSD_SPY_10_rolling_corr.png"),
-                            "Correlación móvil EURUSD vs SPY/US500 — gráfico")
-    print(f"📄 Informe PDF generado: {pdf_path}")
-
-# =======================
-# EDA (principal)
-# =======================
-def ejecutar_eda(df_eurusd=None, df_spy=None, cfg: dict = None):
+def derive_recommendations(
+    df_eurusd: Optional[pd.DataFrame],
+    df_spy: Optional[pd.DataFrame],
+    frecuencia: str,
+    outdir: str = "outputs/eda",
+    alias_eur: str = "EURUSD",
+    alias_spy: str = "SPY",
+) -> Dict[str, Any]:
     """
-    EDA ampliado y claro:
-    - HEAD (primeras filas)
-    - Precio + Tendencia (MA)
-    - Serie de Precio
-    - Descomposición STL
-    - Distribución (Hist+KDE) y QQ-plot de log-returns
-    - Volatilidad rolling (σ) y ATR(14) si hay OHLC
-    - ACF/PACF de log-returns
-    - Curva de drawdown
-    - Correlación móvil (si hay ambos activos)
-
-    Control por config (ejemplo):
-      cfg['eda'] = {
-        'frecuencia_resampleo': 'D'     # o 'H', '15T', etc.
-        'outdir': 'outputs/eda',
-        'ventana_media_movil': 30,
-        'acf_lags': 40,
-        'rolling_vol_windows': [20,60,120],
-        'rolling_corr_window': 60,
-        'export_pdf': True,
-        'pdf_filename': 'EDA_informe.pdf',
-        'alias_eur': 'EURUSD',
-        'alias_spy': 'SPY'
-      }
+    Devuelve recomendaciones de modelado/operación a partir de evidencia estadística:
+      - Prophet/SARIMA: estacionalidad (daily/weekly/yearly, m)
+      - Modo de modelado: 'retornos' intradía, 'nivel' diario (heurística)
+      - Umbrales: pips (EURUSD) y % (SPY) basados en ATR y σ de log-returns
+      - Sizing: riesgo_pct ajustado por volatilidad relativa
     """
-    eda_cfg = (cfg or {}).get("eda", {})
-    freq = str(eda_cfg.get("frecuencia_resampleo", "D"))
-    outdir = eda_cfg.get("outdir", "outputs/eda")
-    win_ma = int(eda_cfg.get("ventana_media_movil", 30))
-    acf_lags = int(eda_cfg.get("acf_lags", 40))
-    rv_windows = eda_cfg.get("rolling_vol_windows", [20,60,120])
-    rc_window = int(eda_cfg.get("rolling_corr_window", 60))
-    alias_eur = eda_cfg.get("alias_eur", "EURUSD")
-    alias_spy = eda_cfg.get("alias_spy", "SPY")
     _safe_mkdir(outdir)
+    rec: Dict[str, Any] = {"frecuencia": frecuencia, "activos": {}, "portafolio": {}}
 
-    activos = [(alias_eur, df_eurusd), (alias_spy, df_spy)]
-    heads, resumenes, stats_map = {}, {}, {}
-    artifacts = {}
-
-    # --- Procesa cada activo ---
-    for symbol, df in activos:
-        if df is None:
-            continue
-
-        # Preparación
-        df = _ensure_dt_index(df)
-        price_col = _find_close(df)
-        df = _resample_ohlc(df, freq=freq, price_col=price_col)
+    def _process_asset(df: pd.DataFrame, alias: str, is_fx: bool):
+        d = _ensure_dt_index(df)
+        price_col = _find_close(d)
+        d = _resample_ohlc(d, freq=frecuencia, price_col=price_col)
 
         # Derivadas
-        ret, logret = _compute_returns_blocks(df, price_col)
-        atr = _atr_if_available(df)
+        ret, lret = _compute_returns_blocks(d, price_col)
+        sigma20 = float(lret.rolling(20).std().iloc[-1]) if lret.dropna().size > 20 else float(np.nan)
+        sigma60 = float(lret.rolling(60).std().iloc[-1]) if lret.dropna().size > 60 else float(np.nan)
+        atr = _atr_if_available(d)
+        atr_last = float(atr.iloc[-1]) if atr is not None and atr.notna().any() else float('nan')
 
-        # HEAD
-        head_df = _to_naive_index(df.head(5))
-        heads[symbol] = head_df
+        # STL strength
+        m = _seasonal_period_by_freq(frecuencia)
+        stl_s = _stl_strength(d[price_col], m)
 
-        # RESUMEN básico
-        resumen = pd.DataFrame([{
-            "activo": symbol,
-            "filas": int(df[price_col].count()),
-            "inicio": df.index.min(),
-            "fin": df.index.max(),
-            "precio_ultimo": float(df[price_col].iloc[-1]),
-            "precio_promedio": float(df[price_col].mean()),
-            "precio_min": float(df[price_col].min()),
-            "precio_max": float(df[price_col].max()),
-        }])
-        resumen["inicio"] = pd.to_datetime(resumen["inicio"], utc=True).dt.tz_localize(None)
-        resumen["fin"]   = pd.to_datetime(resumen["fin"],   utc=True).dt.tz_localize(None)
-        resumenes[symbol] = resumen
+        # Heurísticas de seasonality / modo
+        intradia = any(x in frecuencia.lower() for x in ['t', 'min', 'h'])
+        modo = 'retornos' if intradia else 'nivel'
 
-        # STATS de log-returns
-        stats_lr = _compute_stats(logret)
-        stats_map[symbol] = stats_lr
+        prophet_seasonal = {
+            "daily": bool(intradia),
+            "weekly": True,
+            "yearly": False if intradia else True
+        }
+        sarima_m = m
 
-        # Gráficos
-        p1 = _plot_precio_tendencia(df, price_col, symbol, outdir, win_ma=win_ma)
-        p2 = _plot_serie_precio(df, price_col, symbol, outdir)
-        p3 = _plot_stl(df, price_col, symbol, outdir, seasonal=_stl_period_by_freq(freq))
-        p4 = _plot_hist_kde(logret, symbol, outdir)
-        p5 = _plot_qq(logret, symbol, outdir)
-        p6 = _plot_rolling_vol(logret, symbol, outdir, windows=rv_windows, atr=atr)
-        p7, p8 = _plot_acf_pacf(logret, symbol, outdir, lags=acf_lags)
-        p9 = _plot_drawdown(df[price_col], symbol, outdir)
+        # Umbral recomendado
+        if is_fx:
+            # Basado en ATR: convertir a pips
+            if np.isfinite(atr_last):
+                atr_pips = _pips_from_price(atr_last, alias)
+                umbral_mid_pips = max(3.0, min(20.0, 0.5 * atr_pips))   # 50% del ATR, acotado
+                umbral_low_pips = max(2.0, min(15.0, 0.3 * atr_pips))   # 30% del ATR
+                umbral_high_pips = max(4.0, min(30.0, 0.8 * atr_pips))  # 80% del ATR
+            else:
+                # fallback por σ de log-returns: aproximación de pips
+                if np.isfinite(sigma20) and d[price_col].notna().any():
+                    px = float(d[price_col].iloc[-1])
+                    est_move = px * sigma20  # ~ desviación del precio
+                    est_pips = _pips_from_price(est_move, alias)
+                    umbral_mid_pips = max(3.0, min(20.0, 0.5 * est_pips))
+                    umbral_low_pips = max(2.0, min(15.0, 0.3 * est_pips))
+                    umbral_high_pips = max(4.0, min(30.0, 0.8 * est_pips))
+                else:
+                    umbral_low_pips = 3.0; umbral_mid_pips = 5.0; umbral_high_pips = 8.0
+            umbral_reco = {
+                "tipo": "pips",
+                "low": round(umbral_low_pips, 2),
+                "mid": round(umbral_mid_pips, 2),
+                "high": round(umbral_high_pips, 2),
+            }
+        else:
+            # Equity/ETF: umbral en %
+            if np.isfinite(sigma20):
+                # Regla: low=0.7σ, mid=1.0σ, high=1.3σ (en %)
+                umbral_low = max(0.05, min(2.0, 100.0 * 0.7 * sigma20))
+                umbral_mid = max(0.07, min(3.0, 100.0 * 1.0 * sigma20))
+                umbral_high = max(0.10, min(4.0, 100.0 * 1.3 * sigma20))
+            else:
+                umbral_low = 0.10; umbral_mid = 0.15; umbral_high = 0.25
+            umbral_reco = {
+                "tipo": "percent",
+                "low": round(umbral_low, 3),
+                "mid": round(umbral_mid, 3),
+                "high": round(umbral_high, 3),
+            }
 
-        # Consolida artifacts para el PDF
-        artifacts[symbol] = {
-            "HEAD": head_df,
-            "RESUMEN": resumen,
-            "STATS": stats_lr,
-            "IMG_01": p1, "IMG_02": p2, "IMG_03": p3, "IMG_04": p4,
-            "IMG_05": p5, "IMG_06": p6, "IMG_07": p7, "IMG_08": p8, "IMG_09": p9
+        # Sizing recomendado (ajuste por volatilidad)
+        # Base 2%; escala por sigma60 vs mediana histórica sigma60 (proxy robusto)
+        sigma_hist = lret.rolling(60).std().dropna()
+        if not sigma_hist.empty:
+            sigma_mediana = float(sigma_hist.median())
+            if np.isfinite(sigma60) and sigma_mediana > 0:
+                factor = min(1.0, max(0.4, sigma_mediana / sigma60))  # si volatilidad actual > histórica → baja tamaño
+                riesgo_pct = round(0.02 * factor, 4)
+            else:
+                riesgo_pct = 0.02
+        else:
+            riesgo_pct = 0.02
+
+        rec['activos'][alias] = {
+            "frecuencia": frecuencia,
+            "modo_modelado": modo,  # 'retornos' intradía, 'nivel' diario (heurística)
+            "prophet": {
+                "daily_seasonality": prophet_seasonal["daily"],
+                "weekly_seasonality": prophet_seasonal["weekly"],
+                "yearly_seasonality": prophet_seasonal["yearly"],
+                "interval_width": 0.90,
+                "seasonality_mode": "additive"
+            },
+            "sarima": {
+                "m": sarima_m,
+                "order_sugerido": (3,0,3) if modo == 'retornos' else (1,1,1),
+                "seasonal_order_sugerido": (1,1,1,sarima_m) if (not intradia or sarima_m in (7,24)) else (0,0,0,0)
+            },
+            "mlp": {
+                "lookback": 20 if not intradia else 20,
+                "hidden_layer_sizes": (64,32),
+                "modo": modo
+            },
+            "lstm": {
+                "lookback": 40 if intradia else 40,
+                "epochs": 40 if intradia else 30,
+                "modo": modo
+            },
+            "umbrales": umbral_reco,
+            "risk": {
+                "riesgo_pct_recomendado": riesgo_pct,
+                "sigma20": sigma20,
+                "sigma60": sigma60,
+                "ATR14": atr_last if np.isfinite(atr_last) else None
+            },
+            "stl_strength": stl_s
         }
 
-        # Mensajes en consola
-        print(f"— {symbol} —")
-        print("HEAD (5 filas):")
-        print(head_df)
-        print("Resumen:")
-        print(resumen.to_string(index=False))
-        print("Stats log-returns:")
-        print(stats_lr.to_string(index=False))
-        print(f"Gráficos guardados en: {outdir}")
-        print("-"*60)
+    # Procesa EURUSD
+    if df_eurusd is not None:
+        _process_asset(df_eurusd, alias_eur, is_fx=True)
+    # Procesa SPY/US500
+    if df_spy is not None:
+        _process_asset(df_spy, alias_spy, is_fx=False)
 
-    # --- Correlación si hay ambos ---
-    corr_df = roll_corr = None
-    if (df_eurusd is not None) and (df_spy is not None):
-        # recompute con alias "limpios"
-        # EUR
-        dfe = _resample_ohlc(_ensure_dt_index(df_eurusd), freq=freq, price_col=_find_close(df_eurusd))
-        _, lre = _compute_returns_blocks(dfe, _find_close(dfe))
-        # SPY/US500
-        dfs = _resample_ohlc(_ensure_dt_index(df_spy), freq=freq, price_col=_find_close(df_spy))
-        _, lrs = _compute_returns_blocks(dfs, _find_close(dfs))
+    # Sugerencias de portafolio (placeholder sencillo)
+    if "EURUSD" in rec["activos"] and alias_spy in rec["activos"]:
+        rec["portafolio"] = {
+            "nota": "Las correlaciones intradía suelen ser inestables; trate los activos con sizing independiente.",
+            "diversificacion": "Asignación equitativa inicial; ajustar según desempeño y drawdown."
+        }
+    return rec
 
-        # Matriz correlación
-        m = lre.dropna().rename(f"lr_{alias_eur}").to_frame().join(
-            lrs.dropna().rename(f"lr_{alias_spy}").to_frame(), how="inner"
-        ).dropna()
-        if not m.empty:
-            corr_df = m.corr()
 
-            # Rolling correlation
-            rc_path, roll_corr = _plot_rolling_corr(lre, lrs, outdir, window=rc_window,
-                                                    title_suffix=f"{alias_eur} vs {alias_spy}")
+# =======================
+# Exportadores de recomendaciones
+# =======================
+def save_recommendations_json(reco: Dict[str, Any], outdir: str = "outputs/eda", filename: str = "recomendaciones.json") -> str:
+    _safe_mkdir(outdir)
+    path = os.path.join(outdir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(reco, f, ensure_ascii=False, indent=2)
+    print(f"💾 Recomendaciones (JSON): {path}")
+    return path
 
-    # --- Exporta Excel ---
-    if heads:
-        out_xlsx = os.path.join(outdir, "EDA_informe.xlsx")
-        _export_excel(out_xlsx, heads, resumenes, stats_map, corr_df, roll_corr)
-        print(f"📊 Excel generado: {out_xlsx}")
+def save_recommendations_excel(reco: Dict[str, Any], outdir: str = "outputs/eda", filename: str = "recomendaciones.xlsx") -> str:
+    _safe_mkdir(outdir)
+    path = os.path.join(outdir, filename)
+    # aplanar
+    rows = []
+    for sym, v in reco.get("activos", {}).items():
+        um = v.get("umbrales", {})
+        risk = v.get("risk", {})
+        rows.append({
+            "Activo": sym,
+            "Frecuencia": v.get("frecuencia"),
+            "Modo_modelado": v.get("modo_modelado"),
+            "Prophet_daily": v.get("prophet",{}).get("daily_seasonality"),
+            "Prophet_weekly": v.get("prophet",{}).get("weekly_seasonality"),
+            "Prophet_yearly": v.get("prophet",{}).get("yearly_seasonality"),
+            "SARIMA_m": v.get("sarima",{}).get("m"),
+            "SARIMA_order_sug": str(v.get("sarima",{}).get("order_sugerido")),
+            "SARIMA_seasonal_sug": str(v.get("sarima",{}).get("seasonal_order_sugerido")),
+            "MLP_lookback": v.get("mlp",{}).get("lookback"),
+            "LSTM_lookback": v.get("lstm",{}).get("lookback"),
+            "Umbral_tipo": um.get("tipo"),
+            "Umbral_low": um.get("low"),
+            "Umbral_mid": um.get("mid"),
+            "Umbral_high": um.get("high"),
+            "Riesgo_pct": risk.get("riesgo_pct_recomendado"),
+            "sigma20": risk.get("sigma20"),
+            "sigma60": risk.get("sigma60"),
+            "ATR14": risk.get("ATR14"),
+            "STL_seasonal_strength": v.get("stl_strength",{}).get("seasonal_strength"),
+            "STL_trend_strength": v.get("stl_strength",{}).get("trend_strength"),
+        })
+    df_out = pd.DataFrame(rows)
+    try:
+        with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm") as w:
+            df_out.to_excel(w, sheet_name="Recomendaciones", index=False)
+    except Exception:
+        with pd.ExcelWriter(path, engine="openpyxl") as w:
+            df_out.to_excel(w, sheet_name="Recomendaciones", index=False)
+    print(f"📊 Recomendaciones (Excel): {path}")
+    return path
 
-    # --- Exporta PDF ---
-    if (cfg or {}).get("eda", {}).get("export_pdf", True):
-        _export_pdf(outdir, artifacts, corr_df, roll_corr,
-                    filename=(cfg or {}).get("eda", {}).get("pdf_filename", "EDA_informe.pdf"))
 
-    print("✅ EDA completado.")
+# =======================
+# Pipeline principal
+# =======================
+def run_eda_and_recommend(
+    df_eurusd: Optional[pd.DataFrame],
+    df_spy: Optional[pd.DataFrame],
+    cfg: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    1) Ejecuta EDA (genera PDF + Excel de diagnóstico).
+    2) Deriva recomendaciones (JSON + Excel) para modelado/operación.
+    Devuelve el diccionario de recomendaciones.
+    """
+    eda_cfg = (cfg or {}).get("eda", {})
+    frecuencia = str(eda_cfg.get("frecuencia_resampleo", "D"))
+    outdir = eda_cfg.get("outdir", "outputs/eda")
+    alias_eur = eda_cfg.get("alias_eur", "EURUSD")
+    alias_spy = eda_cfg.get("alias_spy", "SPY")
+
+    # 1) Ejecutar EDA con tu script (genera PDF + Excel de EDA)
+    ejecutar_eda(df_eurusd=df_eurusd, df_spy=df_spy, cfg=cfg)
+
+    # 2) Derivar recomendaciones (modelo, umbrales, sizing)
+    reco = derive_recommendations(
+        df_eurusd=df_eurusd,
+        df_spy=df_spy,
+        frecuencia=frecuencia,
+        outdir=outdir,
+        alias_eur=alias_eur,
+        alias_spy=alias_spy
+    )
+
+    # Guardar recomendaciones
+    save_recommendations_json(reco, outdir=outdir, filename="recomendaciones.json")
+    save_recommendations_excel(reco, outdir=outdir, filename="recomendaciones.xlsx")
+
+    # Imprimir resumen corto en consola
+    for sym, v in reco.get("activos", {}).items():
+        um = v["umbrales"]
+        print(f"→ {sym}: modo={v['modo_modelado']}, Prophet(d={v['prophet']['daily_seasonality']},w={v['prophet']['weekly_seasonality']},y={v['prophet']['yearly_seasonality']}), "
+              f"SARIMA m={v['sarima']['m']}, umbral {um['tipo']}=({um['low']}, {um['mid']}, {um['high']}), riesgo_pct≈{v['risk']['riesgo_pct_recomendado']}")
+    return reco
+
+
+# =======================
+# Ejemplo de uso (quítalo o adáptalo a tu runner)
+# =======================
+if __name__ == "__main__":
+    # Ejemplo mínimo: carga tus DataFrames aquí (reemplaza por tu carga real)
+    # df_eurusd = pd.read_csv("data/eurusd.csv")   # Debe incluir columna de tiempo y Close/close
+    # df_spy    = pd.read_csv("data/spy.csv")
+    df_eurusd = None
+    df_spy = None
+
+    cfg = {
+        "eda": {
+            "frecuencia_resampleo": "15T",     # 'D' para diario (SPY), '15T' para M15 (EUR/USD)
+            "outdir": "outputs/eda",
+            "ventana_media_movil": 30,
+            "acf_lags": 40,
+            "rolling_vol_windows": [20,60,120],
+            "rolling_corr_window": 60,
+            "export_pdf": True,
+            "pdf_filename": "EDA_informe.pdf",
+            "alias_eur": "EURUSD",
+            "alias_spy": "SPY"
+        }
+    }
+
+    # Corre pipeline (generará PDF/Excel del EDA y JSON/Excel de recomendaciones)
+    run_eda_and_recommend(df_eurusd, df_spy, cfg)

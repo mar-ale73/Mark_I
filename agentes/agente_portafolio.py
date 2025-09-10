@@ -15,3 +15,4 @@ def asignar_capital(balance: float, senal: str, riesgo_pct: float = 0.02) -> flo
 
     capital_asignado = balance * riesgo_pct
     return round(capital_asignado, 2)
+
