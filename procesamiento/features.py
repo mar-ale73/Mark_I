@@ -272,3 +272,11 @@ def factor_umbral_por_volatilidad(df_feat: pd.DataFrame, base_factor: float = 1.
     if not factors:
         return base_factor
     return float(np.mean(factors)) * float(base_factor)
+
+# --- Compatibilidad con código existente ---
+from typing import Dict, Any, Optional  # por si tu editor pide estas anotaciones aquí
+
+
+
+def aplicar_todos_los_indicadores(df: pd.DataFrame, config=None, limpiar_nans: bool=False) -> pd.DataFrame:
+    return aplicar_indicadores(df, config=config, limpiar_nans=limpiar_nans)

@@ -1,6 +1,6 @@
-# prophet_adapter.py
-# Adapter Prophet compatible con la misma interfaz que ARIMA/MLP/LSTM
-# Requisitos: prophet (cmd: pip install prophet), pandas, numpy
+# modelos/prophet_model.py
+# (antes lo llamabas "prophet_adapter.py"; usa este nombre de archivo para que
+#  coincida con tus imports: from modelos.prophet_model import ...)
 
 from __future__ import annotations
 import pandas as pd
@@ -8,28 +8,37 @@ import numpy as np
 from typing import Optional, Dict, Any
 from prophet import Prophet
 
-
 # -------------------------------
 # Helpers
 # -------------------------------
 def _ensure_time_index(df: pd.DataFrame) -> pd.DatetimeIndex:
     """
     Obtiene un índice datetime consistente desde:
-      - Columna 'time', o
-      - Índice datetime (cualquier nombre)
+      - Columna 'time' o 'timestamp', o
+      - Índice datetime ya existente.
     """
     if 'time' in df.columns:
         idx = pd.to_datetime(df['time'])
+    elif 'timestamp' in df.columns:
+        idx = pd.to_datetime(df['timestamp'])
     elif isinstance(df.index, pd.DatetimeIndex):
         idx = df.index
     else:
-        raise ValueError("Se requiere columna 'time' o índice datetime en el DataFrame.")
+        raise ValueError("Se requiere columna 'time'/'timestamp' o un índice datetime en el DataFrame.")
+
+    # <- Quitar timezone si existe (clave para Prophet)
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        idx = idx.tz_localize(None)
+
+    # Asegurar orden ascendente
     if not idx.is_monotonic_increasing:
         df2 = df.copy()
         df2.index = idx
         df2 = df2.sort_index()
         return df2.index
+
     return idx
+
 
 
 def _validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,13 +73,13 @@ def _seasonality_defaults_from_freq(freq: Optional[str]) -> Dict[str, bool]:
 
 
 # -------------------------------
-# API pública
+# API pública (tu base)
 # -------------------------------
 def entrenar_modelo_prophet(
     df: pd.DataFrame,
     modo: str = 'nivel',                     # 'nivel' | 'retornos'
-    frecuencia_hint: Optional[str] = None,   # '15min' | '1H' | 'D' ... (opcional pero recomendado)
-    interval_width: float = 0.90,            # bandas de confianza 90%
+    frecuencia_hint: Optional[str] = None,   # '15min' | '1H' | 'D' ...
+    interval_width: float = 0.90,
     seasonality_mode: str = 'additive',      # 'additive' | 'multiplicative'
     changepoint_prior_scale: float = 0.05,
 ) -> Dict[str, Any]:
@@ -107,10 +116,6 @@ def entrenar_modelo_prophet(
         changepoint_prior_scale=changepoint_prior_scale,
         interval_width=interval_width
     )
-
-    # Si quisieras estacionalidades adicionales, aquí puedes añadir Fourier terms, etc.
-    # p.ej.: m.add_seasonality(name='hourly', period=24, fourier_order=6) para intradía.
-
     m.fit(data)
 
     return {
@@ -152,7 +157,6 @@ def predecir_precio_prophet(
         if ultimo_close is None:
             raise ValueError("No se encontró 'ultimo_close' para reconstruir precio en modo 'retornos'.")
 
-        # Reconstrucción multiplicativa con retornos pronosticados
         r_est = tail['yhat'].to_numpy(dtype=float)
         r_lo  = tail['yhat_lower'].to_numpy(dtype=float)
         r_up  = tail['yhat_upper'].to_numpy(dtype=float)
@@ -175,8 +179,18 @@ def predecir_precio_prophet(
             'yhat_upper': 'max_esperado'
         })[['timestamp_prediccion', 'precio_estimado', 'min_esperado', 'max_esperado']]
 
-    # Tipos consistentes
     out['precio_estimado'] = out['precio_estimado'].astype(float)
     out['min_esperado']    = out['min_esperado'].astype(float)
     out['max_esperado']    = out['max_esperado'].astype(float)
     return out
+
+
+# -------------------------------
+# ALIAS para compatibilidad retro
+# -------------------------------
+def predecir_precio(modelo_dict: Dict[str, Any], pasos: int = 3, frecuencia: Optional[str] = None) -> pd.DataFrame:
+    """Alias para mantener tu API histórica."""
+    return predecir_precio_prophet(modelo_dict, pasos=pasos, frecuencia=frecuencia)
+
+# al final de prophet_model.py
+predecir_precio = predecir_precio_prophet

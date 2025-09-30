@@ -4,17 +4,7 @@ import argparse
 import yaml
 import pandas as pd
 import MetaTrader5 as mt5
-
-from procesamiento.eda_crispdm import ejecutar_eda
-from conexion.easy_Trading import Basic_funcs
-from procesamiento.features import aplicar_todos_los_indicadores
-from modelos.prophet_model import entrenar_modelo_prophet, predecir_precio
-from agentes.agente_analisis import generar_senal_operativa
-from agentes.agente_portafolio import asignar_capital
-from agentes.agente_ejecucion import ejecutar_operacion, generar_reporte_excel
-from modelos.evaluacion_modelos import compute_metrics_prophet
-from reportes.reportes_excel import write_metrics_sheet, append_history
-
+# Los imports “pesados” (features, prophet, agentes, reportes) se hacen dentro de los bloques donde se usan.
 
 def obtener_df_desde_mt5(symbol: str, timeframe, n_barras: int) -> pd.DataFrame:
     """Devuelve DataFrame con columnas: timestamp, Open, High, Low, Close, Volume (UTC)."""
@@ -32,25 +22,27 @@ def obtener_df_desde_mt5(symbol: str, timeframe, n_barras: int) -> pd.DataFrame:
 # =========================
 # 1) CARGA DE CONFIGURACIÓN
 # =========================
-with open("utils/config.yaml", "r") as f:
+with open("utils/config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-# Parámetros base
-simbolo = config["simbolo"]
-timeframe_str = config["timeframe"]
-cantidad = config["cantidad_datos"]
-modelo_str = config["modelo"]
-pasos_pred = config["pasos_prediccion"]
-frecuencia_pred = config["frecuencia_prediccion"]
-umbral_senal = config["umbral_senal"]
+# Parámetros base desde YAML (con defaults para evitar KeyError en modo benchmark)
+simbolo          = config.get("simbolo", "EURUSD")
+timeframe_str    = config.get("timeframe", "M5")
+cantidad         = int(config.get("cantidad_datos", 2000))
 
-# Nuevos parámetros YAML
-riesgo_por_trade = config.get("riesgo_por_trade", 0.02)        # 2% por defecto
-volumen_minimo   = float(config.get("volumen_minimo", 0.01))   # 0.01 lotes por defecto
-stop_loss_pips   = float(config.get("stop_loss_pips", 10))     # 10 pips
-take_profit_pips = float(config.get("take_profit_pips", 20))   # 20 pips
+# Estos 4 son del flujo NORMAL; en benchmark pueden no existir. Ponemos defaults seguros.
+modelo_str       = str(config.get("modelo", "prophet")).lower()
+pasos_pred       = int(config.get("pasos_prediccion", 12))
+frecuencia_pred  = str(config.get("frecuencia_prediccion", "H"))
+umbral_senal     = float(config.get("umbral_senal", 0.0))
+
+# Nuevos parámetros YAML (trading / reportes)
+riesgo_por_trade = float(config.get("riesgo_por_trade", 0.02))
+volumen_minimo   = float(config.get("volumen_minimo", 0.01))
+stop_loss_pips   = float(config.get("stop_loss_pips", 10))
+take_profit_pips = float(config.get("take_profit_pips", 20))
 ruta_reporte     = config.get("ruta_reporte", "outputs/reporte_inversion.xlsx")
-pip_size_cfg     = config.get("pip_size", None)                # opcional, ej. 0.0001 en EURUSD
+pip_size_cfg     = config.get("pip_size", None)
 
 # Mapear timeframe
 timeframes = {
@@ -64,15 +56,73 @@ if timeframe_str not in timeframes:
     raise ValueError(f"Timeframe '{timeframe_str}' no soportado. Usa uno de {list(timeframes.keys())}.")
 timeframe = timeframes[timeframe_str]
 
-# --- CLI ---
+# --- CLI (incluye 'benchmark') ---
 parser = argparse.ArgumentParser()
-parser.add_argument("--modo", choices=["normal", "eda"], default="normal",
-                    help="Ejecuta el flujo normal (trading) o solo el EDA CRISP-DM.")
-parser.add_argument("--freq", default=None,
-                    help="Frecuencia de resampleo para EDA (ej. D, H, 15T). Si se pasa, sobreescribe config.yaml.")
+parser.add_argument(
+    "--modo",
+    choices=["normal", "eda", "benchmark"],
+    default="normal",
+    help="Ejecuta el flujo normal, solo el EDA, o el modo comparativo Benchmark."
+)
+parser.add_argument(
+    "--freq",
+    default=None,
+    help="Frecuencia de resampleo para EDA (ej. D, H, 15T). Si se pasa, sobreescribe config.yaml."
+)
 args, _ = parser.parse_known_args()
 if args.freq:
     config.setdefault("eda", {})["frecuencia_resampleo"] = args.freq
+
+# =========================
+# 1.1) RESOLVER MODO EFECTIVO Y DESVIAR A BENCHMARK SI APLICA
+# =========================
+yaml_modo = str(config.get("modo", "")).strip().lower()
+modo_efectivo = yaml_modo if yaml_modo in {"normal", "eda", "benchmark"} else args.modo
+# El CLI tiene prioridad si pasas --modo explícitamente
+if args.modo in {"normal", "eda", "benchmark"}:
+    modo_efectivo = args.modo
+if modo_efectivo == "benchmark":
+    print("🔎 Modo 'benchmark' ACTIVADO (por YAML o CLI).")
+    try:
+        # Import perezoso: solo si realmente corres benchmark
+        from modelos.evaluacion_modelos import ejecutar_benchmark
+        # 👉 IMPORTA LA FUNCIÓN PARA ESCRIBIR EN TU REPORTE PRINCIPAL
+        from reportes.reportes_excel import write_benchmark_sheet
+    except Exception as e:
+        print("⚠️ Falta implementar el runner de benchmark (paso 3).")
+        print("   Debes definir 'ejecutar_benchmark(cfg)' en modelos/evaluacion_modelos.py")
+        print(f"   Detalle del import: {e}")
+        sys.exit(1)
+
+    try:
+        # Ejecuta el benchmark → df con comparativa de modelos
+        df_resultados = ejecutar_benchmark(config)
+
+        # (1) Excel dedicado a benchmark (aparte)
+        from pathlib import Path
+        ruta_bench = config.get("ruta_reporte_benchmark", "outputs/benchmark_resultados.xlsx")
+        p = Path(ruta_bench)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(p, engine="openpyxl", mode="w") as writer:
+            df_resultados.to_excel(writer, sheet_name="Comparación_Modelos", index=False)
+        print(f"✅ Benchmark finalizado. Resultado escrito en: {p}")
+
+        # (2) TAMBIÉN lo agregamos como hoja al reporte principal
+        ruta_reporte_principal = config.get("ruta_reporte", "outputs/reporte_inversion.xlsx")
+        write_benchmark_sheet(ruta_reporte_principal, df_resultados, sheet_name="Comparación_Modelos")
+        print(f"📄 Hoja 'Comparación_Modelos' agregada a: {ruta_reporte_principal}")
+
+        # Importante: salimos para no correr el flujo normal
+        sys.exit(0)
+
+    except NotImplementedError as nie:
+        print("⚠️ 'ejecutar_benchmark(cfg)' lanzó NotImplementedError (pendiente conectar loader/modelos).")
+        print(f"   Detalle: {nie}")
+        sys.exit(1)
+    except Exception as e:
+        print("❌ Error al ejecutar/escribir el benchmark.")
+        print(f"   Detalle: {e}")
+        sys.exit(1)
 
 
 # =========================
@@ -93,14 +143,17 @@ print("✅ Conexión establecida con MetaTrader 5")
 try:
     # === EDA de dos activos con --modo eda ===
     if args.modo == "eda":
+        # Import perezoso de EDA SOLO si se usa
+        from procesamiento.eda_crispdm import ejecutar_eda
+
         # EURUSD (usa tu 'simbolo' actual o 'simbolo_eurusd' si está en config)
         simbolo_eur = config.get("simbolo_eurusd", simbolo)
         df_eur = obtener_df_desde_mt5(simbolo_eur, timeframe, cantidad)
 
         # SPY: intenta MT5 si tienes el símbolo; si no, usa CSV (ruta en config["spy_csv"])
         df_spy = None
-        simbolo_spy = config.get("simbolo_spy")        # ej. "SPY" si tu broker lo ofrece
-        ruta_spy_csv = config.get("spy_csv")           # ej. "data/spy.csv" si no está en MT5
+        simbolo_spy = config.get("simbolo_spy")
+        ruta_spy_csv = config.get("spy_csv")
 
         if simbolo_spy:
             try:
@@ -122,7 +175,8 @@ try:
         print("✅ EDA completado (ver outputs/eda).")
         sys.exit(0)
 
-    # Instancia de utilidades MT5
+    # Instancia de utilidades MT5 (import perezoso)
+    from conexion.easy_Trading import Basic_funcs
     BF = Basic_funcs(login, clave, servidor, path)
 
     # Tamaño de pip robusto
@@ -146,6 +200,8 @@ try:
     print("Última fecha en datos extraídos:", df.index.max())
 
     print("📈 Calculando indicadores técnicos...")
+    # Import perezoso de features
+    from procesamiento.features import aplicar_todos_los_indicadores
     df_indicadores = aplicar_todos_los_indicadores(df)
 
     # =========================
@@ -153,6 +209,9 @@ try:
     # =========================
     try:
         if config.get("eda", {}).get("habilitar", False):
+            # Import aquí también, porque este branch puede ejecutarse en modo normal
+            from procesamiento.eda_crispdm import ejecutar_eda
+
             # Pasamos el DF con un 'timestamp' explícito para que el EDA sea robusto
             df_eur_eda = (
                 df_indicadores
@@ -169,6 +228,9 @@ try:
     # =========================
     if modelo_str == "prophet":
         print("🤖 Entrenando modelo Prophet...")
+        # Import perezoso de Prophet
+        from modelos.prophet_model import entrenar_modelo_prophet, predecir_precio
+
         modelo = entrenar_modelo_prophet(df_indicadores)
 
         print("🔮 Generando predicción futura...")
@@ -180,6 +242,10 @@ try:
     # =========================
     # 5) SEÑAL + ASIGNACIÓN DE CAPITAL
     # =========================
+    # Imports perezosos de agentes
+    from agentes.agente_analisis import generar_senal_operativa
+    from agentes.agente_portafolio import asignar_capital
+
     senal = generar_senal_operativa(predicciones, umbral=umbral_senal)
     print(f"📢 Señal generada: {senal}")
 
@@ -189,6 +255,8 @@ try:
 
     # Simulación (para registro en reporte)
     precio_actual = (df_indicadores.get('Close', df_indicadores.get('close'))).iloc[-1]
+
+    from agentes.agente_ejecucion import ejecutar_operacion, generar_reporte_excel
     operacion = ejecutar_operacion(simbolo, senal, capital, precio_actual)
     print(f"🧾 Operación simulada: {operacion}")
 
@@ -202,6 +270,10 @@ try:
     # 7) EVALUACIÓN (métricas + horizonte) MODULAR
     # =========================
     try:
+        # Imports perezosos para métricas y escritura
+        from modelos.evaluacion_modelos import compute_metrics_prophet
+        from reportes.reportes_excel import write_metrics_sheet, append_history
+
         metrics = compute_metrics_prophet(
             df_indicadores=df_indicadores,
             predicciones_live=predicciones,
@@ -210,8 +282,8 @@ try:
             simbolo=simbolo,
             timeframe_str=timeframe_str,
             modelo_str=modelo_str,
-            entrenar_fn=entrenar_modelo_prophet,
-            predecir_fn=predecir_precio
+            entrenar_fn=lambda df_: (__import__("modelos.prophet_model", fromlist=["entrenar_modelo_prophet"]).entrenar_modelo_prophet)(df_),
+            predecir_fn=lambda m_, pasos, frecuencia: (__import__("modelos.prophet_model", fromlist=["predecir_precio"]).predecir_precio)(m_, pasos=pasos, frecuencia=frecuencia)
         )
 
         print(
@@ -268,7 +340,8 @@ try:
             sl=sl,
             tp=tp
         )
-        print(f"🚀 Orden enviada a MT5: {senal.UPPER()} {simbolo} con {volumen} lotes")
+        print(f"🚀 Orden enviada a MT5: {senal.upper()} {simbolo} con {volumen} lotes")
+
     else:
         print("❎ No se envió operación real (señal fue 'mantener' o capital = 0)")
 
